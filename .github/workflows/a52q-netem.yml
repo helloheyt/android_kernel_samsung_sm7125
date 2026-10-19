@@ -60,6 +60,12 @@ jobs:
       - name: Setup KernelSU-Next
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
+          # pin to the v3.4.0-legacy tag commit so it matches the released manager (v3.4.2, protocol 5)
+          cd KernelSU-Next
+          git fetch --unshallow origin || git fetch origin
+          git checkout 8af3d4fe
+          git log -1 --oneline
+          cd ..
 
       # ---- netem: add the config to the merged fragment ---------------------
       - name: Enable netem in a52q config
