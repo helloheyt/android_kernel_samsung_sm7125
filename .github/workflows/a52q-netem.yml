@@ -1,0 +1,183 @@
+name: A52 (SM-A525F) netem kernel
+
+# Drop-in replacement for .github/workflows/a52q.yml in your FORK of
+# AlfCraft07/android_kernel_samsung_sm7125.
+#
+# Differences from the upstream workflow:
+#   1. Appends CONFIG_NET_SCH_NETEM=y (+ IFB=y) to the a52q config fragment.
+#   2. Uses YOUR permanent module-signing key from repo secret SIGNING_KEY_PEM
+#      (so the signed modules you build later are trusted by this kernel).
+#      If the secret is absent, a key is generated and uploaded as an artifact
+#      so you still keep it (less private - prefer the secret).
+#   3. Also builds `make modules`, which auto-signs sch_netem.ko, and uploads:
+#        - the AnyKernel3 flashable ZIP (clean flash, touches only boot)
+#        - Image.gz
+#        - sch_netem.ko (already signed)
+#        - scripts/sign-file + signing_key.x509 (your signing toolkit)
+#
+# To use: in your fork, Settings -> Secrets -> Actions, add SIGNING_KEY_PEM
+# with the full contents of signing_key.pem (from gen-signing-key.sh). Then run
+# this workflow from the Actions tab (workflow_dispatch) and download artifacts.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    name: Build netem kernel
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Cache Proton Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/clang
+          key: ${{ runner.os }}-proton-clang-v1
+
+      - name: Setup Proton Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/toolchains
+          git clone https://github.com/kdrag0n/proton-clang.git --depth=1 ~/toolchains/clang
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache cpio flex git kmod \
+            libncurses5-dev libssl-dev rsync zip unzip wget curl ca-certificates dwarves \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu device-tree-compiler libelf-dev
+
+      - name: Setup KernelSU-Next
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
+
+      # ---- netem: add the config to the merged fragment ---------------------
+      - name: Enable netem in a52q config
+        run: |
+          F=arch/arm64/configs/vendor/samsung/a52q.config
+          {
+            echo ''
+            echo '# --- added: netem network emulator (built-in, always available; module signing key still embedded) ---'
+            echo 'CONFIG_NET_SCH_NETEM=y'
+            echo 'CONFIG_IFB=y'
+            echo 'CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"'
+          } >> "$F"
+          echo "a52q.config now ends with:"; tail -n 8 "$F"
+
+      # ---- signing key: use YOUR permanent key, or make+keep one ------------
+      - name: Install module signing key
+        id: key
+        env:
+          SIGNING_KEY_PEM: ${{ secrets.SIGNING_KEY_PEM }}
+        run: |
+          mkdir -p certs
+          if [ -n "$SIGNING_KEY_PEM" ]; then
+            echo "Using SIGNING_KEY_PEM secret as certs/signing_key.pem"
+            printf '%s\n' "$SIGNING_KEY_PEM" > certs/signing_key.pem
+            echo "generated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "generated=true" >> "$GITHUB_OUTPUT"
+            echo "No secret set - generating a key and uploading it as an artifact."
+            cat > certs/x509.genkey <<'EOF'
+          [ req ]
+          default_bits = 4096
+          distinguished_name = req_distinguished_name
+          prompt = no
+          x509_extensions = myexts
+          [ req_distinguished_name ]
+          CN = A52q netem module signing key
+          [ myexts ]
+          basicConstraints=critical,CA:FALSE
+          keyUsage=digitalSignature
+          subjectKeyIdentifier=hash
+          authorityKeyIdentifier=keyid
+          EOF
+            openssl req -new -nodes -utf8 -sha512 -days 36500 -batch -x509 \
+              -config certs/x509.genkey -outform PEM \
+              -out certs/signing_key.pem -keyout certs/signing_key.pem
+          fi
+          openssl x509 -outform DER -in certs/signing_key.pem -out certs/signing_key.x509 || true
+
+      - name: Compile Kernel + modules
+        run: |
+          export PATH=~/toolchains/clang/bin:$PATH
+          export ARCH=arm64 SUBARCH=arm64 CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE64=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-
+          export LLVM=1 LLVM_IAS=1
+          rm -rf out && mkdir -p out
+          make O=out vendor/samsung/sm7125_defconfig
+          scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/vendor/samsung/a52q.config
+          # keep our signing key path after merge
+          ./scripts/config --file out/.config --set-str MODULE_SIG_KEY "certs/signing_key.pem"
+          make O=out olddefconfig
+          echo "netem config:"; grep NET_SCH_NETEM out/.config || true
+          set -o pipefail
+          make O=out -j$(nproc) Image.gz 2>&1 | tee build.log
+          # build + sign any remaining =m modules; non-fatal (netem is built in)
+          make O=out -j$(nproc) modules 2>&1 | tee -a build.log || echo "modules step failed (non-fatal)"
+          # modules are auto-signed during build because MODULE_SIG_FORCE=y
+          find out -name 'sch_netem.ko' -exec cp {} . \;
+          cp out/scripts/sign-file . 2>/dev/null || cp scripts/sign-file . 2>/dev/null || true
+          cp certs/signing_key.x509 . 2>/dev/null || true
+
+      - name: Setup AnyKernel3 + package
+        run: |
+          git clone --depth=1 https://github.com/AlfCraft07/AnyKernel3.git ~/AnyKernel3
+          cd ~/AnyKernel3 && rm -rf .git* README.md
+          cat > anykernel.sh <<'EOF'
+          #!/sbin/sh
+          properties() { '
+          kernel.string=Legion netem kernel for a52q (SM-A525F)
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a52q
+          device.name2=SM-A525F
+          supported.versions=11-16
+          '; }
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          boot_img_hdr_ver=2
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+          chmod +x anykernel.sh
+          cp "$GITHUB_WORKSPACE/out/arch/arm64/boot/Image.gz" .
+          ZIP="legion-a52q-netem-$(date +%Y%m%d).zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP" *
+          echo "ZIP=$ZIP" >> $GITHUB_ENV
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: a52q-netem-kernel
+          path: |
+            ${{ env.ZIP }}
+            out/arch/arm64/boot/Image.gz
+            sch_netem.ko
+            sign-file
+            signing_key.x509
+            build.log
+
+      - name: Upload generated key (only if no secret was set)
+        if: ${{ steps.key.outputs.generated == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: GENERATED-signing-key-KEEP-PRIVATE
+          path: certs/signing_key.pem
