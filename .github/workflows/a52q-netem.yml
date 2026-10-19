@@ -60,10 +60,10 @@ jobs:
       - name: Setup KernelSU-Next
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
-          # pin to the v3.4.0-legacy tag commit so it matches the released manager (v3.4.2, protocol 5)
+          # pin to the legacy commit of 2026-10-07 (before the manager protocol bump, matches released manager v3.4.2)
           cd KernelSU-Next
           git fetch --unshallow origin || git fetch origin
-          git checkout 8af3d4fe
+          git checkout 8869bd76
           git log -1 --oneline
           cd ..
 
